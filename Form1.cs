@@ -7,6 +7,8 @@ using System.Collections.Generic;
 
 namespace ProductivityLog
 {
+    // todo add heartbeat data to the log to indicate whether the process was recording
+    // todo record to which window the keys are directed
     public partial class MainFrm : Form
     {
         [DllImport("user32.dll")] private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
@@ -83,7 +85,8 @@ namespace ProductivityLog
             binaryLogWriter = new BinaryWriter(binaryLog);
             textLogWriter = File.AppendText(textLogFilename);
             textLogWriter.AutoFlush = true;
-            hookId = SetHook(HookCallback);
+            hookProcDelegate = HookCallback;
+            hookId = SetHook();
         }
 
         private void ExitToolStripMenuItem_Click(object sender, EventArgs e)
@@ -186,9 +189,9 @@ namespace ProductivityLog
             UnhookWindowsHookEx(hookId);
         }
 
-        private static IntPtr SetHook(HookProc hookProc)
+        private static IntPtr SetHook()
         {
-            return SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, GetModuleHandle(Process.GetCurrentProcess().MainModule.ModuleName), 0);
+            return SetWindowsHookEx(WH_KEYBOARD_LL, hookProcDelegate, GetModuleHandle(Process.GetCurrentProcess().MainModule.ModuleName), 0);
         }
 
         private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -199,6 +202,8 @@ namespace ProductivityLog
         }
 
         private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        private static HookProc hookProcDelegate;
         private static IntPtr hookId = IntPtr.Zero;
 
         private FileStream binaryLog;
