@@ -4,6 +4,8 @@ using System.IO;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
+using System.Text;
+using System.Linq;
 
 namespace ProductivityLog
 {
@@ -15,11 +17,16 @@ namespace ProductivityLog
         [DllImport("user32.dll")] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
         [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
         [DllImport("kernel32.dll")] private static extern IntPtr GetModuleHandle(string lpModuleName);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
 
         private const int WH_KEYBOARD_LL = 13;
         private const int WM_KEYDOWN = 0x0100;
         private const string binaryLogFilename = "log.log";
         private const string textLogFilename = "log.txt";
+
+        const int HeartbeatCode = 65534;
+        const int WindowSwitchCode = 65534;
 
         private static HashSet<Keys> NonDelimiters = new HashSet<Keys>
         {
@@ -75,12 +82,17 @@ namespace ProductivityLog
         {
             mainFrm = this;
             InitializeComponent();
+            heartbeatTimer.Elapsed += ( sender, e ) => Heartbeat();
+            activeWindowTimer.Elapsed += (sender, e) => LogActiveWindow();
         }
 
-        // todo save context so that the app can be restarted without losing the running count for the day.
+        // -------------------------------------------------------------------------------------------------
+        // Events
+        // -------------------------------------------------------------------------------------------------
+
         private void MainFrm_Load(object sender, EventArgs e)
         {
-            CountCharactersFromPreviousLog();
+            CountKeystrokesFromPreviousLog();
             binaryLog = new FileStream(binaryLogFilename, FileMode.Append);
             binaryLogWriter = new BinaryWriter(binaryLog);
             textLogWriter = File.AppendText(textLogFilename);
@@ -89,12 +101,11 @@ namespace ProductivityLog
             hookId = SetHook();
         }
 
-        private void ExitToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            Close();
-        }
+        private void ExitToolStripMenuItem_Click(object sender, EventArgs e) => Close();
 
-        private void CountCharacter(Keys key)
+        private void MainFrm_FormClosed(object sender, FormClosedEventArgs e) => UnhookWindowsHookEx(hookId);
+
+        private void CountKeystroke(Keys key)
         {
             keyStrokes++;
             bool isChar = IsCharacter(key);
@@ -103,7 +114,7 @@ namespace ProductivityLog
             wasCharacter = isChar;
         }
 
-        void CountCharactersFromPreviousLog()
+        void CountKeystrokesFromPreviousLog()
         {
             if (!File.Exists(binaryLogFilename))
                 return;
@@ -115,9 +126,18 @@ namespace ProductivityLog
                     while ( true )
                     {
                         var timestamp = binaryLogReader.ReadUInt32();
-                        Keys key = (Keys)binaryLogReader.ReadUInt32();
-                        if (IntToDateTime(timestamp).Date == DateTime.Today)
-                            CountCharacter(key);
+                        uint value = binaryLogReader.ReadUInt32();
+                        if (!IsOpCode(value))
+                        {
+                            Keys key = (Keys)binaryLogReader.ReadUInt32();
+                            if (IntToDateTime(timestamp).Date == DateTime.Today)
+                                CountKeystroke(key);
+                        }
+                        else if (value == WindowSwitchCode)
+                        {
+                            binaryLogReader.ReadString(); // window title
+                            binaryLogReader.ReadString(); // process name
+                        }
                     }
                  }
             }
@@ -127,20 +147,16 @@ namespace ProductivityLog
             finally
             {
                 prevLog.Close();
-                UpdateUI();
+                UpdateIconText();
             }
         }
 
 
-        private static bool IsCharacter(Keys key)
-        {
-            return NonDelimiters.Contains(key);
-        }
+        private static bool IsCharacter(Keys key) => NonDelimiters.Contains(key);
 
-        private static bool IsLogToTextLog(Keys key)
-        {
-            return IsCharacter(key) || key == Keys.Space || key == Keys.Enter;
-        }
+        private static bool IsOpCode(UInt32 code) => code == HeartbeatCode || code == WindowSwitchCode;
+
+        private static bool ShouldLokKeyToTextLog(Keys key) => IsCharacter(key) || key == Keys.Space || key == Keys.Enter;
 
         private static char ToCharacter(Keys key)
         {
@@ -157,42 +173,29 @@ namespace ProductivityLog
             return (char)0;
         }
 
-        void UpdateUI()
-        {
-            notifyIcon.Text = keyStrokes + " keystrokes, " + words + " words";
-        }
+        void UpdateIconText() => notifyIcon.Text = keyStrokes + " keystrokes, " + words + " words";
 
         // todo make this into an extension method.
-        private static UInt32 DateTimeToInt(DateTime dateTime)
-        {
-            return (UInt32)(dateTime.ToUniversalTime() - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
-        }
+        private static UInt32 DateTimeToInt(DateTime dateTime) =>  (uint)(dateTime.ToUniversalTime() - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
         
-        private static DateTime IntToDateTime(UInt32 value)
-        {
-            return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(value);
-        }
+        private static DateTime IntToDateTime(UInt32 value) => LogFileBaseTime.AddSeconds(value);
         
         private void KeyPressed(Keys key)
         {
-            binaryLogWriter.Write(DateTimeToInt(DateTime.Now));
-            binaryLogWriter.Write((UInt32)key);
-            binaryLogWriter.Flush();
-            CountCharacter(key);
-            if (IsLogToTextLog(key))
+            lock (binaryLogWriter)
+            {
+                binaryLogWriter.Write(DateTimeToInt(DateTime.Now));
+                binaryLogWriter.Write((UInt32)key);
+                binaryLogWriter.Flush();
+            }
+            CountKeystroke(key);
+            if (ShouldLokKeyToTextLog(key))
                 textLogWriter.Write(ToCharacter(key));
-            UpdateUI();
+            UpdateIconText();
         }
 
-        private void MainFrm_FormClosed(object sender, FormClosedEventArgs e)
-        {
-            UnhookWindowsHookEx(hookId);
-        }
 
-        private static IntPtr SetHook()
-        {
-            return SetWindowsHookEx(WH_KEYBOARD_LL, hookProcDelegate, GetModuleHandle(Process.GetCurrentProcess().MainModule.ModuleName), 0);
-        }
+        private static IntPtr SetHook() => SetWindowsHookEx(WH_KEYBOARD_LL, hookProcDelegate, GetModuleHandle(Process.GetCurrentProcess().MainModule.ModuleName), 0);
 
         private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
@@ -201,10 +204,47 @@ namespace ProductivityLog
             return CallNextHookEx(hookId, nCode, wParam, lParam);
         }
 
-        private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+        void Heartbeat()
+        {
+            lock (binaryLogWriter)
+            {
+                binaryLogWriter.Write(DateTimeToInt(DateTime.Now));
+                binaryLogWriter.Write(HeartbeatCode);
+                binaryLogWriter.Flush();
+            }
+        }
 
+        void LogActiveWindow()
+        {
+            lock (activeWindowTimer)
+            {
+                IntPtr handle = GetForegroundWindow();
+                StringBuilder windowTitleBuilder = new StringBuilder(512);
+                GetWindowText(handle, windowTitleBuilder, 512);
+                string windowTitle = windowTitleBuilder.ToString();
+                if (windowTitle != lastWindowTitle)
+                {
+                    var matchingProcess = processList.FirstOrDefault((Process process) => process.MainWindowHandle == handle);
+                    if (matchingProcess == null)
+                        processList = Process.GetProcesses();
+                    matchingProcess = processList.FirstOrDefault((Process process) => process.MainWindowHandle == handle);
+                    lastWindowTitle = windowTitle;
+                    lock (binaryLogWriter)
+                    {
+                        binaryLogWriter.Write(DateTimeToInt(DateTime.Now));
+                        binaryLogWriter.Write(WindowSwitchCode);
+                        binaryLogWriter.Write(windowTitle);
+                        binaryLogWriter.Write(matchingProcess?.ProcessName ?? "");
+                        binaryLogWriter.Flush();
+                    }
+                }
+            }
+        }
+
+        static DateTime LogFileBaseTime = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
         private static HookProc hookProcDelegate;
         private static IntPtr hookId = IntPtr.Zero;
+        private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
 
         private FileStream binaryLog;
         private StreamWriter textLogWriter;
@@ -213,6 +253,9 @@ namespace ProductivityLog
         private int words;
         private int keyStrokes;
         private bool wasCharacter;
+        private System.Timers.Timer heartbeatTimer = new System.Timers.Timer() { Interval = 60000, Enabled = true };
+        private System.Timers.Timer activeWindowTimer = new System.Timers.Timer() { Interval = 1000, Enabled = true };
+        private Process[] processList = new Process[0];
+        private string lastWindowTitle;
     }
-
 }
